@@ -3,23 +3,33 @@ import base64
 import io
 import numpy as np
 from PIL import Image, ImageOps
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
 import cv2
-import pytesseract
 from segment_anything import sam_model_registry, SamPredictor
+from ultralytics import YOLO
 from utils import save_image, encode_image_to_base64, visualize_mask_with_box, handle_exception
+from craft import CRAFT
+from craft_utils import getDetBoxes
+from imgproc import resize_aspect_ratio, normalizeMeanVariance
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from collections import OrderedDict
+from datetime import datetime
 
-# Manually specify tesseract path (update this path if yours is different)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+craft_model = None
+trocr_processor = None
+trocr_model = None
 
-
-# Load model
+# Load SAM model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b.pth")
 predictor = SamPredictor(sam)
 sam.to(device)
+
+# Load YOLO barcode model
+barcode_model = YOLO("./best.pt")
+barcode_model.to(device)
 
 app = FastAPI()
 
@@ -31,7 +41,7 @@ def detect_segment_and_crop(image: np.ndarray, box: list) -> dict:
     predictor.set_image(image)
     input_box = np.array([box])
     start = time.time()
-    masks, scores, _ = predictor.predict(box=input_box)
+    masks, scores, _ = predictor.predict(box=input_box, multimask_output=False)
     elapsed = time.time() - start
 
     mask = masks[0]
@@ -56,107 +66,143 @@ def detect_segment_and_crop(image: np.ndarray, box: list) -> dict:
         "cropped_image": cropped,
         "mask": mask,
         "inference_time": elapsed,
-        "box": input_box
+        "box": input_box,
+        "full_image": image
     }
 
-def combine_detected_segments_from_array(img: np.ndarray, display_steps=True):
+def extract_object_as_png(image: np.ndarray, mask: np.ndarray, output_path="object_extracted.png"):
+    mask = (mask * 255).astype(np.uint8)
+    image_rgba = cv2.cvtColor(image, cv2.COLOR_RGB2RGBA)
+    image_rgba[:, :, 3] = mask
+    cv2.imwrite(output_path, image_rgba)
+
+def detect_and_draw_barcodes(image: np.ndarray, save_path="barcodes.jpg", conf_threshold=0.25):
+    results = barcode_model(image, conf=conf_threshold)
+    boxes = results[0].boxes
+
+    image_with_boxes = image.copy()
+
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        conf = box.conf[0].item()
+        label = f"Barcode: {conf:.2f}"
+        cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(image_with_boxes, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    cv2.imwrite(save_path, cv2.cvtColor(image_with_boxes, cv2.COLOR_RGB2BGR))
+    print(f"✅ Barcode image saved as {save_path}")
+    return save_path
+
+def init_ocr_models():
+    global craft_model, trocr_processor, trocr_model
+    if craft_model is None:
+        craft_model = CRAFT()
+        state_dict = torch.load("craft_mlt_25k.pth", map_location=device)
+        if list(state_dict.keys())[0].startswith("module"):
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:]
+                new_state_dict[name] = v
+            state_dict = new_state_dict
+        craft_model.load_state_dict(state_dict)
+        craft_model = craft_model.to(device).eval()
+
+    if trocr_model is None or trocr_processor is None:
+        trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed", use_fast=True)
+        trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
+        trocr_model = trocr_model.to(device).eval()
+
+def run_ocr_in_box(image: np.ndarray, box: list):
     """
-    OCR pipeline that receives an image (as a NumPy array), detects text segments,
-    annotates them, and prints performance metrics.
-
-    Args:
-        img: Input image as a NumPy array (e.g., cropped from SAM)
-        display_steps: If True, shows intermediate steps using OpenCV
-
-    Returns:
-        result: Annotated image with text boxes and labels
-        detected_word_positions: List of (text, (x, y, w, h)) for each word
-        performance: Dictionary of performance metrics
+    Performs CRAFT + TrOCR OCR only inside the given bounding box.
+    Saves output image (ocr_output.jpg) and text (ocr_output.txt).
     """
-    def display_cv_image(image, title="Image"):
-        cv2.imshow(title, image)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+    init_ocr_models()
 
-    start_time = time.time()
-    result = img.copy()
+    x1, y1, x2, y2 = map(int, box)
+    cropped = image[y1:y2, x1:x2]
+    original_crop = cropped.copy()
 
-    if display_steps:
-        print("Original Image:")
-        display_cv_image(img)
+    # Resize and normalize
+    img_resized, target_ratio, _ = resize_aspect_ratio(cropped, 1280, interpolation=cv2.INTER_LINEAR)
+    ratio_h = ratio_w = 1 / target_ratio
+    x = normalizeMeanVariance(img_resized)
+    x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).float().to(device)
 
-    # Preprocess
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.convertScaleAbs(gray, alpha=1.0, beta=0.05)
-    gray_resized = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    with torch.no_grad():
+        y, _ = craft_model(x)
 
-    if display_steps:
-        print("Resized Grayscale Image:")
-        display_cv_image(gray_resized)
+    score_text = y[0, :, :, 0].cpu().data.numpy()
+    score_link = y[0, :, :, 1].cpu().data.numpy()
 
-    binary = cv2.adaptiveThreshold(
-        gray_resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, np.ones((1, 1), np.uint8))
+    boxes, _ = getDetBoxes(score_text, score_link, text_threshold=0.7, link_threshold=0.4, low_text=0.4, poly=False)
+    boxes = np.array(boxes) * (2 / target_ratio)
 
-    if display_steps:
-        print("Binary Image:")
-        display_cv_image(closed)
+    # Merge boxes by line
+    merged_boxes = []
+    used = [False] * len(boxes)
+    for i, b1 in enumerate(boxes):
+        if used[i]: continue
+        group = [b1]; used[i] = True
+        for j in range(i + 1, len(boxes)):
+            if used[j]: continue
+            b2 = boxes[j]
+            if abs(np.mean(b1[:,1]) - np.mean(b2[:,1])) < 15:  # same line
+                group.append(b2); used[j] = True
+        all_x = np.concatenate([b[:, 0] for b in group])
+        all_y = np.concatenate([b[:, 1] for b in group])
+        merged = np.array([
+            [np.min(all_x), np.min(all_y)],
+            [np.max(all_x), np.min(all_y)],
+            [np.max(all_x), np.max(all_y)],
+            [np.min(all_x), np.max(all_y)]
+        ])
+        merged_boxes.append(merged)
 
-    inference_start = time.time()
-    config = r'--oem 3 --psm 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ: '
-    ocr_data = pytesseract.image_to_data(closed, output_type=pytesseract.Output.DICT, config=config)
-    inference_end = time.time()
-    inference_time = inference_end - inference_start
+    # Run TrOCR
+    results = []
+    for idx, box in enumerate(merged_boxes):
+        box = np.int32(box)
+        cx1 = max(int(np.min(box[:, 0])), 0)
+        cy1 = max(int(np.min(box[:, 1])), 0)
+        cx2 = min(int(np.max(box[:, 0])), cropped.shape[1])
+        cy2 = min(int(np.max(box[:, 1])), cropped.shape[0])
 
-    text_conf = [ocr_data['text'][i] for i in range(len(ocr_data['text'])) if int(ocr_data['conf'][i]) >= 40]
-    full_text = " ".join(text_conf)
-    segments = full_text.split()
+        region = cropped[cy1:cy2, cx1:cx2]
+        if region.size == 0: continue
+        pil_image = Image.fromarray(cv2.cvtColor(region, cv2.COLOR_BGR2RGB)).convert("RGB").resize((384, 384))
+        pixel_values = trocr_processor(images=pil_image, return_tensors="pt").pixel_values.to(device)
 
-    print(f"\n🧠 OCR Detected Full Text: '{full_text}'")
-    print(f"OCR Segments: {segments}")
-    print(f"OCR Inference Time: {inference_time:.4f}s")
+        with torch.no_grad():
+            generated_ids = trocr_model.generate(pixel_values)
+            text = trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            results.append((box, text.strip()))
 
-    result_resized = cv2.resize(result, None, fx=1, fy=1)
-    detected_word_positions = []
+    # Draw and save
+    for box, text in results:
+        box = np.int32(box)
+        cv2.polylines(cropped, [box.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
+        cv2.putText(cropped, text, (int(box[0][0]), int(box[0][1]) - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-    for i in range(len(ocr_data['text'])):
-        word = ocr_data['text'][i].strip()
-        if word and int(ocr_data['conf'][i]) >= 40:
-            x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
-            cv2.rectangle(result_resized, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(result_resized, word, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            detected_word_positions.append((word, (x, y, w, h)))
-            print(f"🟩 Word '{word}' found at (x={x}, y={y}, w={w}, h={h})")
+    cv2.imwrite("ocr_output.jpg", cropped)
+    with open("ocr_output.txt", "w", encoding="utf-8") as f:
+        for _, text in results:
+            f.write(text + "\n")
 
-    if display_steps:
-        print("Final Annotated OCR Image:")
-        display_cv_image(result_resized)
+    print("✅ Saved OCR outputs: ocr_output.jpg and ocr_output.txt")
 
-    end_time = time.time()
-    total_time = end_time - start_time
-
-    performance = {
-        'total_time': total_time,
-        'inference_time': inference_time,
-        'total_segments': len(detected_word_positions)
-    }
-
-    print(f"\nPerformance Summary:")
-    print(f"Total Time: {total_time:.4f}s")
-    print(f"Text Segments Found: {len(detected_word_positions)}")
-
-    # Save the image with annotations
-    cv2.imwrite("ocr_with_boxes.jpg", result_resized)
-
-    return result_resized, detected_word_positions, performance
-
+def log_time(message: str, log_file="log.txt"):
+    with open(log_file, "a") as f:
+        f.write(message + "\n")
 
 @app.post("/segment")
 async def segment(req: SegmentRequest):
     try:
+        start_total = time.time()
+
+        # Decode base64 image
+        start_decode = time.time()
         if "," in req.image:
             _, encoded = req.image.split(",", 1)
         else:
@@ -164,29 +210,52 @@ async def segment(req: SegmentRequest):
         image_data = base64.b64decode(encoded)
         pil_image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_data))).convert("RGB")
         image = np.array(pil_image)
+        end_decode = time.time()
+        log_time(f"[TIMING] Image decoding: {end_decode - start_decode:.3f} seconds")
 
-        print("Received image size:", image.shape[:2])
-        print("Frontend box:", req.box)
+        log_time(f"Received image size: {image.shape[:2]}")
+        log_time(f"Frontend box: {req.box}")
 
+        # SAM segmentation and cropping
+        start_sam = time.time()
         result = detect_segment_and_crop(image, req.box)
+        end_sam = time.time()
+        log_time(f"[TIMING] SAM segmentation + crop: {end_sam - start_sam:.3f} seconds")
 
         save_image(result["cropped_image"], "output.jpg")
+
+        start_vis = time.time()
         vis_b64 = visualize_mask_with_box(result["mask"], image, result["box"], save_path="mask.jpg")
         crop_b64 = encode_image_to_base64(result["cropped_image"])
+        end_vis = time.time()
+        log_time(f"[TIMING] Mask visualization & encoding: {end_vis - start_vis:.3f} seconds")
 
-        # 🔍 OCR Detection
-        ocr_result_img, ocr_boxes, ocr_metrics = combine_detected_segments_from_array(result["cropped_image"], display_steps=False)
-        cv2.imwrite("ocr_with_boxes.jpg", ocr_result_img)
+        start_extract = time.time()
+        extract_object_as_png(result["full_image"], result["mask"], output_path="object_extracted.png")
+        end_extract = time.time()
+        log_time(f"[TIMING] Extract transparent object: {end_extract - start_extract:.3f} seconds")
 
-        print("\n🧠 OCR Text Segments:")
-        for word, (x, y, w, h) in ocr_boxes:
-            print(f" - '{word}' at x={x}, y={y}, w={w}, h={h}")
+        # Barcode detection (draws on full image, saves as barcodes.jpg)
+        start_barcode = time.time()
+        detect_and_draw_barcodes(image, save_path="barcodes.jpg")
+        end_barcode = time.time()
+        log_time(f"[TIMING] Barcode detection & save: {end_barcode - start_barcode:.3f} seconds")
+
+        # OCR inside box (CRAFT + TrOCR)
+        start_ocr = time.time()
+        run_ocr_in_box(image, req.box)
+        end_ocr = time.time()
+        log_time(f"[TIMING] OCR in box (CRAFT + TrOCR): {end_ocr - start_ocr:.3f} seconds")
+
+        end_total = time.time()
+        log_time(f"[TIMING] Total pipeline time: {end_total - start_total:.3f} seconds")
 
         return {
             "status": "success",
             "inference_time": result["inference_time"],
             "cropped_base64": crop_b64,
-            "mask_visualization_base64": vis_b64
+            "mask_visualization_base64": vis_b64,
+            "message": "Transparent object saved as object_extracted.png, barcodes saved as barcodes.jpg"
         }
 
     except Exception as e:
